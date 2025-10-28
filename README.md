@@ -20,6 +20,13 @@ python scripts/rsl_rl/train_race.py \
     --num_envs 8192 \
     --max_iterations 5000 \
     --headless
+
+python scripts/rsl_rl/train_race.py \
+    --task Isaac-Quadcopter-Race-v0 \
+    --num_envs 1024 \
+    --max_iterations 1000 \
+    --headless \
+    --logger wandb
 ```
 
 ## Evaluation
@@ -31,6 +38,15 @@ python scripts/rsl_rl/play_race.py \
     --task Isaac-Quadcopter-Race-v0 \
     --num_envs 1 \
     --load_run [YYYY-MM-DD_XX-XX-XX] \  # The run directory is in logs/rsl_rl/quadcopter_direct/
+    --checkpoint best_model.pt \
+    --headless \
+    --video \
+    --video_length 800
+
+python scripts/rsl_rl/play_race.py \
+    --task Isaac-Quadcopter-Race-v0 \
+    --num_envs 1 \
+    --load_run 2025-10-26_12-19-38 \
     --checkpoint best_model.pt \
     --headless \
     --video \

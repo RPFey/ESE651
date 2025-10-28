@@ -148,6 +148,51 @@ class PPO:
         ) in generator:
             # TODO ----- START -----
             # Implement the PPO update step
+            # observations: batch of observations for the actor - (N, obs_dim)
+            # critic_observations: batch of observations for the critic - (N, obs_dim)
+            # sampled_actions: batch of actions taken - (N, action_dim)
+            # value_targets: batch of target values - (N, 1)
+            # advantage_estimates: batch of advantage estimates - (N, 1)
+            # discounted_returns: batch of discounted returns - (N, 1)
+            # prev_log_probs: batch of log probabilities of the actions under the old policy - (N, 1)
+            # prev_mean_actions: batch of mean actions under the old policy - (N, action_dim)
+            # prev_action_stds: batch of action standard deviations under the old policy - (N, action_dim)
+            # hidden_states: batch of hidden states for recurrent -- None
+            # episode_masks: batch of episode masks -- None 
+                
+            # update the criterion for value loss
+            value_criterion = nn.MSELoss()
+            
+            # Loss for critic
+            values = self.actor_critic.evaluate(critic_observations).squeeze(1)
+            critic_loss = value_criterion(values, value_targets)
+            
+            # Update the distribution for the current policy
+            # get action log prob
+            self.actor_critic.update_distribution(observations)
+            action_log_prob = self.actor_critic.get_actions_log_prob(sampled_actions)
+            ppo_ratio = torch.exp(action_log_prob - prev_log_probs)
+            ppo_ratio_clipped = torch.clamp(ppo_ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+            ppo_loss = -torch.min(ppo_ratio * advantage_estimates, ppo_ratio_clipped * advantage_estimates).mean()
+            
+            # Entropy bonus
+            entropy = self.actor_critic.entropy.mean()
+            
+            # Total loss
+            total_loss = (
+                critic_loss * self.value_loss_coef + ppo_loss - entropy * self.entropy_coef
+            )
+            
+            # Gradient descent step
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            
+            # Accumulate statistics
+            mean_entropy += entropy.item()
+            mean_value_loss += critic_loss.item()
+            mean_surrogate_loss += ppo_loss.item()
             # TODO ----- END -----
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
