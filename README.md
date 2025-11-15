@@ -23,7 +23,7 @@ python scripts/rsl_rl/train_race.py \
 
 python scripts/rsl_rl/train_race.py \
     --task Isaac-Quadcopter-Race-v0 \
-    --num_envs 1024 \
+    --num_envs 2048 \
     --max_iterations 1000 \
     --headless \
     --logger wandb

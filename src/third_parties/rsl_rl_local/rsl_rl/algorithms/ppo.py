@@ -159,41 +159,74 @@ class PPO:
             # prev_action_stds: batch of action standard deviations under the old policy - (N, action_dim)
             # hidden_states: batch of hidden states for recurrent -- None
             # episode_masks: batch of episode masks -- None 
-                
-            # update the criterion for value loss
-            value_criterion = nn.MSELoss()
             
-            # Loss for critic
-            values = self.actor_critic.evaluate(critic_observations).squeeze(1)
-            critic_loss = value_criterion(values, value_targets)
-            
-            # Update the distribution for the current policy
-            # get action log prob
-            self.actor_critic.update_distribution(observations)
-            action_log_prob = self.actor_critic.get_actions_log_prob(sampled_actions)
-            ppo_ratio = torch.exp(action_log_prob - prev_log_probs)
-            ppo_ratio_clipped = torch.clamp(ppo_ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
-            ppo_loss = -torch.min(ppo_ratio * advantage_estimates, ppo_ratio_clipped * advantage_estimates).mean()
-            
-            # Entropy bonus
-            entropy = self.actor_critic.entropy.mean()
-            
-            # Total loss
-            total_loss = (
-                critic_loss * self.value_loss_coef + ppo_loss - entropy * self.entropy_coef
+            # Check if we should normalize advantages per mini batch
+            if self.normalize_advantage_per_mini_batch:
+                with torch.no_grad():
+                    advantage_estimates = (advantage_estimates - advantage_estimates.mean()) / (advantage_estimates.std() + 1e-8)
+                    
+            self.actor_critic.act(observations, masks=episode_masks, hidden_states=hidden_states[0])
+            current_log_probs = self.actor_critic.get_actions_log_prob(sampled_actions)
+            # -- critic
+            current_values = self.actor_critic.evaluate(
+                critic_observations, masks=episode_masks, hidden_states=hidden_states[1]
             )
-            
-            # Gradient descent step
+            # -- entropy
+            current_mean = self.actor_critic.action_mean
+            current_std = self.actor_critic.action_std
+            policy_entropy = self.actor_critic.entropy
+
+            # KL
+            if self.desired_kl is not None and self.schedule == "adaptive":
+                with torch.inference_mode():
+                    kl = torch.sum(
+                        torch.log(current_std / prev_action_stds + 1.0e-5)
+                        + (torch.square(prev_action_stds) + torch.square(prev_mean_actions - current_mean))
+                        / (2.0 * torch.square(current_std))
+                        - 0.5,
+                        axis=-1,
+                    )
+                    kl_mean = torch.mean(kl)
+
+                    if kl_mean > self.desired_kl * 2.0:
+                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
+
+            # Surrogate loss
+            ratio = torch.exp(current_log_probs - torch.squeeze(prev_log_probs))
+            surrogate = -torch.squeeze(advantage_estimates) * ratio
+            surrogate_clipped = -torch.squeeze(advantage_estimates) * torch.clamp(
+                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            )
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+            # Value function loss
+            if self.use_clipped_value_loss:
+                value_clipped = value_targets + (current_values - value_targets).clamp(
+                    -self.clip_param, self.clip_param
+                )
+                value_losses = (current_values - discounted_returns).pow(2)
+                value_losses_clipped = (value_clipped - discounted_returns).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (discounted_returns - current_values).pow(2).mean()
+
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * policy_entropy.mean()
+
+            # Gradient step
             self.optimizer.zero_grad()
-            total_loss.backward()
+            loss.backward()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
-            
-            # Accumulate statistics
-            mean_entropy += entropy.item()
-            mean_value_loss += critic_loss.item()
-            mean_surrogate_loss += ppo_loss.item()
-            # TODO ----- END -----
+
+            # Store the losses
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_entropy += policy_entropy.mean().item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
