@@ -37,7 +37,7 @@ import csv
 from scipy.spatial.transform import Rotation as R
 
 # Import strategy class
-from .quadcopter_strategies import DefaultQuadcopterStrategy
+from .quadcopter_strategies import DefaultQuadcopterStrategy, PassGateGPT1
 
 ##
 # Drone config
@@ -230,7 +230,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     rewards = {}
 
     # Strategy class for custom rewards, observations, and resets
-    strategy_class: type[DefaultQuadcopterStrategy] = DefaultQuadcopterStrategy
+    strategy_class: type[DefaultQuadcopterStrategy] = PassGateGPT1
 
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg

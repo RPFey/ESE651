@@ -2,13 +2,13 @@ algorithm:
   class_name: PPO
   # training parameters
   # -- advantage normalization
-  normalize_advantage_per_mini_batch: false
+  normalize_advantage_per_mini_batch: true
   # -- value function
   value_loss_coef: 1.0
   clip_param: 0.2
-  use_clipped_value_loss: true
+  use_clipped_value_loss: false
   # -- surrogate loss
-  desired_kl: 0.01
+  desired_kl: 0.005
   entropy_coef: 0.01
   gamma: 0.99
   lam: 0.95

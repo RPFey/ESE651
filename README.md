@@ -21,9 +21,10 @@ python scripts/rsl_rl/train_race.py \
     --max_iterations 5000 \
     --headless
 
-python scripts/rsl_rl/train_race.py \
+python  scripts/rsl_rl/train_race.py \
     --task Isaac-Quadcopter-Race-v0 \
     --num_envs 2048 \
+    --experiment_name gptv1 \
     --max_iterations 1000 \
     --headless \
     --logger wandb
@@ -46,7 +47,7 @@ python scripts/rsl_rl/play_race.py \
 python scripts/rsl_rl/play_race.py \
     --task Isaac-Quadcopter-Race-v0 \
     --num_envs 1 \
-    --load_run 2025-10-26_12-19-38 \
+    --load_run 2025-11-15_20-50-23 \
     --checkpoint best_model.pt \
     --headless \
     --video \
