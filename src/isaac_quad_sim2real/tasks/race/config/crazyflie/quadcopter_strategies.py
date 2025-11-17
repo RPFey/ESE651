@@ -364,8 +364,8 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
 
         gate_quat = self.env._waypoints_quat[self.env._idx_wp, :]
         gate_yaw = euler_xyz_from_quat(gate_quat)[2]
-        yaw_error = wrap_to_pi(gate_yaw - drone_yaw)
-        yaw_reward = torch.exp(-2.5 * torch.abs(yaw_error))
+        yaw_error = torch.abs(wrap_to_pi(gate_yaw) - wrap_to_pi(drone_yaw))
+        yaw_reward = torch.exp(-1.5 * torch.abs(yaw_error))
 
         # (D) Velocity alignment (reward forward body velocity)
         vel_body = self.env._robot.data.root_com_lin_vel_b
@@ -431,8 +431,8 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         reward = (
             + 4.0 * (1 - gate_passed) * progress_reward # if drone passes gate, no more progress reward until next gate
             # + 2.0 * alignment_reward
-            # + gate_passed * 0.2 * yaw_reward
-            + 0.1 * velocity_reward
+            # + gate_passed * 2.0 * yaw_reward
+            # + 0.1 * velocity_reward
             + 2.0 * gate_bonus # gate bonus
             + smoothness_penalty
             + ang_rate_penalty
@@ -533,42 +533,59 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         # This example code initializes the drone 2m behind the first gate. You should delete it or heavily
         # modify it once you begin the racing task.
 
-        # start from the zeroth waypoint (beginning of the race)
-        waypoint_indices = torch.zeros(n_reset, device=self.device, dtype=self.env._idx_wp.dtype)
+        num_gates = self.env._waypoints.shape[0]
 
-        # get starting poses behind waypoints
-        x0_wp = self.env._waypoints[waypoint_indices][:, 0]
-        y0_wp = self.env._waypoints[waypoint_indices][:, 1]
-        theta = self.env._waypoints[waypoint_indices][:, -1]
-        z_wp = self.env._waypoints[waypoint_indices][:, 2]
+        # 1) pick a random gate for each env
+        gate_idx = torch.randint(
+            low=0,
+            high=num_gates,
+            size=(n_reset,),
+            device=self.device
+        )
+
+        # 2) randomly choose: spawn BEFORE (0) or AFTER (1) the gate
+        spawn_after = torch.randint(
+            low=0,
+            high=2,
+            size=(n_reset,),
+            device=self.device
+        ).float()
+
+        # gate pose
+        gate_x = self.env._waypoints[gate_idx][:, 0]
+        gate_y = self.env._waypoints[gate_idx][:, 1]
+        gate_z = self.env._waypoints[gate_idx][:, 2]
+        gate_yaw = self.env._waypoints[gate_idx][:, -1]
         
-        # Randomized spawn behind gate 0
-        dist = torch.rand(len(env_ids), device=self.device) * 1.5 + 1.5   # 1.5–3.0 m behind
-        lat  = (torch.rand(len(env_ids), device=self.device) - 0.5) * 1.0 # ±0.5 m lateral
-        zoff = (torch.rand(len(env_ids), device=self.device) * 0.05 - 0.025)       # ±0.025 m above gate height
+        # 3) local-frame spawn offsets
+        # BEFORE gate: x_local ∈ [-3, -1]
+        # AFTER gate:  x_local ∈ [ 1,  3]
+        dist_before = -(torch.rand(n_reset, device=self.device) * 2.0 + 1.0)     # [-3, -1]
+        dist_after  =   torch.rand(n_reset, device=self.device) * 2.0 + 1.0      # [ 1,  3]
+        x_local = dist_before * (1 - spawn_after) + dist_after * spawn_after
 
-        # x_local = -2.0 * torch.ones(n_reset, device=self.device)
-        # y_local = torch.zeros(n_reset, device=self.device)
-        # z_local = torch.zeros(n_reset, device=self.device)
-        x_local = -dist
-        y_local = lat
-        z_local = zoff # torch.zeros(n_reset, device=self.device)
+        y_local = (torch.rand(n_reset, device=self.device) - 0.5) * 1.0           # ±0.5 m
+        z_local = (torch.rand(n_reset, device=self.device) - 0.5) * 0.2           # ±0.1 m
 
-        # rotate local pos to global frame
-        cos_theta = torch.cos(theta)
-        sin_theta = torch.sin(theta)
-        x_rot = cos_theta * x_local - sin_theta * y_local
-        y_rot = sin_theta * x_local + cos_theta * y_local
-        initial_x = x0_wp - x_rot
-        initial_y = y0_wp - y_rot
-        initial_z = z_local + z_wp
+        # 4) rotate from gate frame → world frame
+        cos_t = torch.cos(gate_yaw)
+        sin_t = torch.sin(gate_yaw)
+        x_rot = cos_t * x_local - sin_t * y_local
+        y_rot = sin_t * x_local + cos_t * y_local
 
-        default_root_state[:, 0] = initial_x
-        default_root_state[:, 1] = initial_y
-        default_root_state[:, 2] = initial_z
+        spawn_x = gate_x - x_rot
+        spawn_y = gate_y - y_rot
+        spawn_z = gate_z + z_local
+
+        default_root_state[:, 0] = spawn_x
+        default_root_state[:, 1] = spawn_y
+        default_root_state[:, 2] = spawn_z
 
         # point drone towards the zeroth gate
-        initial_yaw = torch.atan2(y0_wp - initial_y, x0_wp - initial_x)
+        target_gate = (gate_idx + spawn_after.long()) % num_gates
+        tx = self.env._waypoints[target_gate][:, 0]
+        ty = self.env._waypoints[target_gate][:, 1]
+        initial_yaw = torch.atan2(ty - spawn_y, tx - spawn_x)
         quat = quat_from_euler_xyz(
             torch.zeros(1, device=self.device),
             torch.zeros(1, device=self.device),
@@ -609,12 +626,12 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
                 yaw0
             )
             default_root_state[:, 3:7] = quat
-            waypoint_indices = self.env._initial_wp
+            target_gate = self.env._initial_wp
 
         # Set waypoint indices and desired positions
-        self.env._idx_wp[env_ids] = waypoint_indices
+        self.env._idx_wp[env_ids] = (target_gate).int()
 
-        self.env._desired_pos_w[env_ids, :3] = self.env._waypoints[waypoint_indices, :3].clone()
+        self.env._desired_pos_w[env_ids, :3] = self.env._waypoints[target_gate, :3].clone()
         # self.env._desired_pos_w[env_ids, 2] = self.env._waypoints[waypoint_indices, 2].clone()
 
         self.env._last_distance_to_goal[env_ids] = torch.linalg.norm(
