@@ -37,7 +37,7 @@ import csv
 from scipy.spatial.transform import Rotation as R
 
 # Import strategy class
-from .quadcopter_strategies import DefaultQuadcopterStrategy, PassGateGPT1
+from .quadcopter_strategies import * # DefaultQuadcopterStrategy, PassGateGPT1
 
 ##
 # Drone config

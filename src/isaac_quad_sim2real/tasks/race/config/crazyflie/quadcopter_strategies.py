@@ -19,6 +19,23 @@ if TYPE_CHECKING:
 D2R = np.pi / 180.0
 R2D = 180.0 / np.pi
 
+def catmull_rom_point(P0, P1, P2, P3, t):
+    t2 = t * t
+    t3 = t2 * t
+    return 0.5 * (
+        2*P1 +
+        (-P0 + P2) * t +
+        (2*P0 - 5*P1 + 4*P2 - P3) * t2 +
+        (-P0 + 3*P1 - 3*P2 + P3) * t3
+    )
+
+def catmull_rom_tangent(P0, P1, P2, P3, t):
+    t2 = t * t
+    return 0.5 * (
+        (-P0 + P2) +
+        2*(2*P0 - 5*P1 + 4*P2 - P3) * t +
+        3*(-P0 + 3*P1 - 3*P2 + P3) * t2
+    )
 
 class DefaultQuadcopterStrategy:
     """Default strategy implementation for quadcopter environment."""
@@ -401,8 +418,27 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         dist_to_gate_yz = torch.linalg.norm(self.env._pose_drone_wrt_gate[:, [1, 2]], dim=1)
         x_now = self.env._pose_drone_wrt_gate[:, 0]
         x_prev = self.env._prev_x_drone_wrt_gate
-        cross_plane = (x_prev < 0) & (x_now > 0)
-        gate_passed = ((dist_to_gate_yz < 0.3) & cross_plane).float()
+        
+        lateral_tolerance, x_tolerance = 0.4, 0.2
+        involume = (
+            (dist_to_gate_yz < lateral_tolerance) & (x_now < 0) & (x_now > -x_tolerance)
+        ).float()
+        gate_passed = (
+            (dist_to_gate_yz < lateral_tolerance) & ( torch.abs(x_now) < x_tolerance / 4) # (x_prev < 0) & (x_now > 0)
+        ).float()
+        
+        # switch to progress in x_direction
+        progress_reward = torch.where(
+            involume > 0., 4 * torch.tanh( (x_now - x_prev) * 2.0 ), progress_reward
+        )
+
+        # if self.cfg.is_train:
+        #     cross_plane = (x_prev < 0) & (x_now > 0)
+        #     gate_passed = ((dist_to_gate_yz < 0.4) & cross_plane).float()
+        # else:
+        #     cross_plane = torch.abs(x_now) < 0.2
+        #     gate_passed = ((dist_to_gate_yz < 0.4) & cross_plane).float()
+        
         ids_gate_passed = torch.where(gate_passed)[0]
         
         # Advance waypoint for passed envs
@@ -423,20 +459,20 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
             self.env._prev_x_drone_wrt_gate[ids_gate_passed] = new_pos_gate[:, 0]
         
         # ---------------------------------------------------------
-        gate_bonus = gate_passed * torch.exp( - dist_to_gate_yz / 0.2 )
+        gate_bonus = gate_passed * torch.exp( - dist_to_gate_yz / 0.4 )
 
         # ---------------------------------------------------------
         # 4. Combine rewards
         # ---------------------------------------------------------
         reward = (
-            + 4.0 * (1 - gate_passed) * progress_reward # if drone passes gate, no more progress reward until next gate
+            + 20.0 * (1 - gate_passed) * progress_reward # if drone passes gate, no more progress reward until next gate
             # + 2.0 * alignment_reward
-            # + gate_passed * 2.0 * yaw_reward
+            + involume * 2.0 * yaw_reward
             # + 0.1 * velocity_reward
-            + 2.0 * gate_bonus # gate bonus
+            + 40.0 * gate_bonus # gate bonus
             + smoothness_penalty
             + ang_rate_penalty
-            + (-8.0) * crashed
+            + (-10.0) * crashed
         )
 
         if self.cfg.is_train:
@@ -582,7 +618,7 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         default_root_state[:, 2] = spawn_z
 
         # point drone towards the zeroth gate
-        target_gate = (gate_idx + spawn_after.long()) % num_gates
+        target_gate = ((gate_idx + spawn_after.long()) % num_gates).int()
         tx = self.env._waypoints[target_gate][:, 0]
         ty = self.env._waypoints[target_gate][:, 1]
         initial_yaw = torch.atan2(ty - spawn_y, tx - spawn_x)
@@ -629,7 +665,7 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
             target_gate = self.env._initial_wp
 
         # Set waypoint indices and desired positions
-        self.env._idx_wp[env_ids] = (target_gate).int()
+        self.env._idx_wp[env_ids] = (target_gate)#.int()
 
         self.env._desired_pos_w[env_ids, :3] = self.env._waypoints[target_gate, :3].clone()
         # self.env._desired_pos_w[env_ids, 2] = self.env._waypoints[waypoint_indices, 2].clone()
@@ -654,3 +690,206 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
 
         self.env._prev_x_drone_wrt_gate = self.env._pose_drone_wrt_gate[:, 0].clone()
         self.env._crashed[env_ids] = 0
+        
+class PassGateGPT2(PassGateGPT1):
+    
+    def Catmull_Rom_spline(self, gate_idx):
+        num_gates = self.env._waypoints.shape[0]
+        gate_id_prev = (gate_idx - 1) % num_gates
+        gate_id_next = (gate_idx + 1) % num_gates
+        gate_id_nextp = (gate_idx + 2) % num_gates
+        
+        P0 = self.env._waypoints[gate_id_prev, :3]
+        P1 = self.env._waypoints[gate_idx, :3]
+        P2 = self.env._waypoints[gate_id_next, :3]
+        P3 = self.env._waypoints[gate_id_nextp, :3]
+        
+        noise = torch.randn_like(P1) * self.initial_noise
+        t = torch.rand((len(gate_idx), 1), device=self.device)
+        spawn_pts = catmull_rom_point(P0, P1, P2, P3, t) + noise
+
+        # point drone towards the zeroth gate
+        target_gate = gate_id_next.int()
+        tx = self.env._waypoints[target_gate][:, 0]
+        ty = self.env._waypoints[target_gate][:, 1]
+        initial_yaw = torch.atan2(ty - spawn_pts[:, 1], tx - spawn_pts[:, 0])
+        quat = quat_from_euler_xyz(
+            torch.zeros(1, device=self.device),
+            torch.zeros(1, device=self.device),
+            initial_yaw + torch.empty(1, device=self.device).uniform_(-0.15, 0.15)
+        )
+        
+        return spawn_pts, quat
+    
+    def Hermit_spline(self, gate_idx):
+        num_gates = self.env._waypoints.shape[0]
+        gate_idx_next = (gate_idx + 1) % num_gates
+        
+        def hermite_segment(p0, p1, m0, m1, t):
+            # t = np.linspace(0, 1, n)[:, None]   # shape (n,1)
+            t2 = t * t
+            t3 = t2 * t
+
+            h00 = 2*t3 - 3*t2 + 1
+            h10 = t3 - 2*t2 + t
+            h01 = -2*t3 + 3*t2
+            h11 = t3 - t2
+            return h00*p0 + h10*m0 + h01*p1 + h11*m1
+        
+        P0 = self.env._waypoints[gate_idx, :3]
+        P1 = self.env._waypoints[gate_idx_next, :3]
+        
+        P0_yaw = self.env._waypoints[gate_idx, -1]
+        P1_yaw = self.env._waypoints[gate_idx_next, -1]
+        m0 = torch.stack([torch.cos(P0_yaw), torch.sin(P0_yaw), torch.zeros_like(P0_yaw)], dim=1) * 8.0
+        m1 = torch.stack([torch.cos(P1_yaw), torch.sin(P1_yaw), torch.zeros_like(P1_yaw)], dim=1) * 8.0
+        
+        max_ratio = max(0, 0.85 - self.initial_noise)
+        t = (0.9 - max_ratio) * torch.rand((len(gate_idx), 1), device=P0.device) + max_ratio
+        
+        noise = torch.randn_like(P1) * self.initial_noise
+        spawn_pts = hermite_segment(P0, P1, m0, m1, t) + noise
+        
+        # point drone towards the zeroth gate
+        target_gate = gate_idx_next.int()
+        tx = self.env._waypoints[target_gate][:, 0]
+        ty = self.env._waypoints[target_gate][:, 1]
+        initial_yaw = torch.atan2(ty - spawn_pts[:, 1], tx - spawn_pts[:, 0])
+        quat = quat_from_euler_xyz(
+            torch.zeros(1, device=self.device),
+            torch.zeros(1, device=self.device),
+            initial_yaw + torch.empty(1, device=self.device).uniform_(-0.15, 0.15)
+        )
+        
+        return spawn_pts, quat
+        
+    def reset_idx(self, env_ids):
+        """Reset specific environments to initial states."""
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self.env._robot._ALL_INDICES
+
+        # Logging for training mode
+        gate_passed = self._episode_sums["gate_passed"]
+        self.initial_noise = max(0.05, torch.mean(gate_passed).item() * 4)
+        if self.cfg.is_train and hasattr(self, '_episode_sums'):
+            extras = dict()
+            for key in self._episode_sums.keys():
+                episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+                extras["Episode_Reward/" + key] = episodic_sum_avg / self.env.max_episode_length_s
+                self._episode_sums[key][env_ids] = 0.0
+            self.env.extras["log"] = dict()
+            self.env.extras["log"].update(extras)
+            extras = dict()
+            extras["Episode_Termination/died"] = torch.count_nonzero(self.env.reset_terminated[env_ids]).item()
+            extras["Episode_Termination/time_out"] = torch.count_nonzero(self.env.reset_time_outs[env_ids]).item()
+            self.env.extras["log"].update(extras)
+
+        # Call robot reset first
+        self.env._robot.reset(env_ids)
+
+        # Initialize model paths if needed
+        if not self.env._models_paths_initialized:
+            num_models_per_env = self.env._waypoints.size(0)
+            model_prim_names_in_env = [f"{self.env.target_models_prim_base_name}_{i}" for i in range(num_models_per_env)]
+
+            self.env._all_target_models_paths = []
+            for env_path in self.env.scene.env_prim_paths:
+                paths_for_this_env = [f"{env_path}/{name}" for name in model_prim_names_in_env]
+                self.env._all_target_models_paths.append(paths_for_this_env)
+
+            self.env._models_paths_initialized = True
+
+        n_reset = len(env_ids)
+        if n_reset == self.num_envs and self.num_envs > 1:
+            self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf,
+                                                             high=int(self.env.max_episode_length))
+
+        # Reset action buffers
+        self.env._actions[env_ids] = 0.0
+        self.env._previous_actions[env_ids] = 0.0
+        self.env._previous_yaw[env_ids] = 0.0
+        self.env._motor_speeds[env_ids] = 0.0
+        self.env._previous_omega_meas[env_ids] = 0.0
+        self.env._previous_omega_err[env_ids] = 0.0
+        self.env._omega_err_integral[env_ids] = 0.0
+
+        # Reset joints state
+        joint_pos = self.env._robot.data.default_joint_pos[env_ids]
+        joint_vel = self.env._robot.data.default_joint_vel[env_ids]
+        self.env._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+        default_root_state = self.env._robot.data.default_root_state[env_ids]
+
+        # TODO ----- START ----- Define the initial state during training after resetting an environment.
+        # This example code initializes the drone 2m behind the first gate. You should delete it or heavily
+        # modify it once you begin the racing task.
+        num_gates = self.env._waypoints.shape[0]
+        gate_idx = torch.randint(0, num_gates, (n_reset,), device=self.device) # .item()
+        spawn_pts, quat = self.Hermit_spline(gate_idx)
+        target_gate = ((gate_idx + 1) % num_gates).int()
+        default_root_state[:, :3] = spawn_pts
+        default_root_state[:, 3:7] = quat
+        # TODO ----- END -----
+
+        # Handle play mode initial position
+        if not self.cfg.is_train:
+            # x_local and y_local are randomly sampled
+            x_local = torch.empty(1, device=self.device).uniform_(-3.0, -0.5)
+            y_local = torch.empty(1, device=self.device).uniform_(-1.0, 1.0)
+
+            x0_wp = self.env._waypoints[self.env._initial_wp, 0]
+            y0_wp = self.env._waypoints[self.env._initial_wp, 1]
+            theta = self.env._waypoints[self.env._initial_wp, -1]
+
+            # rotate local pos to global frame
+            cos_theta, sin_theta = torch.cos(theta), torch.sin(theta)
+            x_rot = cos_theta * x_local - sin_theta * y_local
+            y_rot = sin_theta * x_local + cos_theta * y_local
+            x0 = x0_wp - x_rot
+            y0 = y0_wp - y_rot
+            z0 = 0.05
+
+            # point drone towards the zeroth gate
+            yaw0 = torch.atan2(y0_wp - y0, x0_wp - x0)
+
+            default_root_state = self.env._robot.data.default_root_state[0].unsqueeze(0)
+            default_root_state[:, 0] = x0
+            default_root_state[:, 1] = y0
+            default_root_state[:, 2] = z0
+
+            quat = quat_from_euler_xyz(
+                torch.zeros(1, device=self.device),
+                torch.zeros(1, device=self.device),
+                yaw0
+            )
+            default_root_state[:, 3:7] = quat
+            target_gate = self.env._initial_wp
+
+        # Set waypoint indices and desired positions
+        self.env._idx_wp[env_ids] = (target_gate)#.int()
+
+        self.env._desired_pos_w[env_ids, :3] = self.env._waypoints[target_gate, :3].clone()
+        # self.env._desired_pos_w[env_ids, 2] = self.env._waypoints[waypoint_indices, 2].clone()
+
+        self.env._last_distance_to_goal[env_ids] = torch.linalg.norm(
+            self.env._desired_pos_w[env_ids, :3] - self.env._robot.data.root_link_pos_w[env_ids, :3], dim=1
+        )
+        self.env._n_gates_passed[env_ids] = 0
+
+        # Write state to simulation
+        self.env._robot.write_root_link_pose_to_sim(default_root_state[:, :7], env_ids)
+        self.env._robot.write_root_com_velocity_to_sim(default_root_state[:, 7:], env_ids)
+
+        # Reset variables
+        self.env._yaw_n_laps[env_ids] = 0
+
+        self.env._pose_drone_wrt_gate[env_ids], _ = subtract_frame_transforms(
+            self.env._waypoints[self.env._idx_wp[env_ids], :3],
+            self.env._waypoints_quat[self.env._idx_wp[env_ids], :],
+            self.env._robot.data.root_link_state_w[env_ids, :3]
+        )
+
+        self.env._prev_x_drone_wrt_gate = self.env._pose_drone_wrt_gate[:, 0].clone()
+        self.env._crashed[env_ids] = 0
+    
+    
