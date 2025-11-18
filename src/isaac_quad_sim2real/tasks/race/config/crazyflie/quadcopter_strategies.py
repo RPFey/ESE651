@@ -356,6 +356,21 @@ class DefaultQuadcopterStrategy:
         
 class PassGateGPT1(DefaultQuadcopterStrategy):
     """A strategy that extends the DefaultQuadcopterStrategy with a simple modification."""
+    
+    def __init__(self, env):
+        super().__init__(env)
+        # apply small random multiplicative perturbation in [0.95, 1.05]
+        self.env._thrust_to_weight *= torch.empty_like(self.env._thrust_to_weight).uniform_(0.95, 1.05)
+        self.env._K_aero[:, :2] *= torch.empty_like(self.env._K_aero[:, :2]).uniform_(0.5, 2.0)
+        self.env._K_aero[:, 2] *= torch.empty_like(self.env._K_aero[:, 2]).uniform_(0.5, 2.0)
+        
+        self.env._kp_omega[:, :2] *= torch.empty_like(self.env._kp_omega[:, :2]).uniform_(0.85, 1.15)
+        self.env._ki_omega[:, :2] *= torch.empty_like(self.env._ki_omega[:, :2]).uniform_(0.85, 1.15)
+        self.env._kd_omega[:, :2] *= torch.empty_like(self.env._kd_omega[:, :2]).uniform_(0.7, 1.3)
+        
+        self.env._kp_omega[:, 2] *= torch.empty_like(self.env._kp_omega[:, 2]).uniform_(0.85, 1.15)
+        self.env._ki_omega[:, 2] *= torch.empty_like(self.env._ki_omega[:, 2]).uniform_(0.85, 1.15)
+        self.env._kd_omega[:, 2] *= torch.empty_like(self.env._kd_omega[:, 2]).uniform_(0.7, 1.3)
 
     def get_rewards(self) -> torch.Tensor:
         """Reward function optimized for quadcopter gate tracking and racing."""
@@ -692,7 +707,7 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         self.env._crashed[env_ids] = 0
         
 class PassGateGPT2(PassGateGPT1):
-    
+     
     def Catmull_Rom_spline(self, gate_idx):
         num_gates = self.env._waypoints.shape[0]
         gate_id_prev = (gate_idx - 1) % num_gates
