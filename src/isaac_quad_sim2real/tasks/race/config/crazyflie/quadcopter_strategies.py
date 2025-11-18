@@ -414,23 +414,23 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         # ---------------------------------------------------------
         # dist_to_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
         # gate_passed = (dist_to_gate < 0.15).float()   # larger threshold for racing
-        
         dist_to_gate_yz = torch.linalg.norm(self.env._pose_drone_wrt_gate[:, [1, 2]], dim=1)
         x_now = self.env._pose_drone_wrt_gate[:, 0]
         x_prev = self.env._prev_x_drone_wrt_gate
         
-        lateral_tolerance, x_tolerance = 0.4, 0.2
+        volume_tolerance, lateral_tolerance, x_tolerance = 0.4, 0.4, 0.1
+        plane_threshold = 0.05
         involume = (
-            (dist_to_gate_yz < lateral_tolerance) & (x_now < 0) & (x_now > -x_tolerance)
+            (dist_to_gate_yz < volume_tolerance) & (x_now > 0) & (x_now < x_tolerance)
         ).float()
         gate_passed = (
-            (dist_to_gate_yz < lateral_tolerance) & ( torch.abs(x_now) < x_tolerance / 4) # (x_prev < 0) & (x_now > 0)
+            (dist_to_gate_yz < lateral_tolerance) & ( (x_prev > plane_threshold) & (x_now < plane_threshold) )
         ).float()
         
         # switch to progress in x_direction
-        progress_reward = torch.where(
-            involume > 0., 4 * torch.tanh( (x_now - x_prev) * 2.0 ), progress_reward
-        )
+        # progress_reward = torch.where(
+        #     involume > 0., 4 * torch.tanh( (x_prev - x_now) * 2.0 ), progress_reward
+        # )
 
         # if self.cfg.is_train:
         #     cross_plane = (x_prev < 0) & (x_now > 0)
@@ -467,7 +467,7 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         reward = (
             + 20.0 * (1 - gate_passed) * progress_reward # if drone passes gate, no more progress reward until next gate
             # + 2.0 * alignment_reward
-            + involume * 2.0 * yaw_reward
+            # + involume * 2.0 * yaw_reward
             # + 0.1 * velocity_reward
             + 40.0 * gate_bonus # gate bonus
             + smoothness_penalty
