@@ -381,7 +381,7 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
 
         gate_quat = self.env._waypoints_quat[self.env._idx_wp, :]
         gate_yaw = euler_xyz_from_quat(gate_quat)[2]
-        yaw_error = torch.abs(wrap_to_pi(gate_yaw) - wrap_to_pi(drone_yaw))
+        yaw_error = torch.abs(wrap_to_pi(gate_yaw - drone_yaw))
         yaw_reward = torch.exp(-1.5 * torch.abs(yaw_error))
 
         # (D) Velocity alignment (reward forward body velocity)
@@ -418,27 +418,20 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         x_now = self.env._pose_drone_wrt_gate[:, 0]
         x_prev = self.env._prev_x_drone_wrt_gate
         
-        volume_tolerance, lateral_tolerance, x_tolerance = 0.4, 0.4, 0.1
-        plane_threshold = 0.05
-        involume = (
-            (dist_to_gate_yz < volume_tolerance) & (x_now > 0) & (x_now < x_tolerance)
-        ).float()
+        volume_tolerance, lateral_tolerance, x_tolerance = 0.5, 0.5, 0.2
+        plane_threshold = 0.1
+        # involume = (
+        #     (dist_to_gate_yz < volume_tolerance) & (x_now > 0) & (x_now < x_tolerance)
+        # ).float()
+        # plane_cross = ( (x_prev > plane_threshold) & (x_now < plane_threshold) ) | (x_prev < -plane_threshold) & (x_now > -plane_threshold)
         gate_passed = (
-            (dist_to_gate_yz < lateral_tolerance) & ( (x_prev > plane_threshold) & (x_now < plane_threshold) )
+            (dist_to_gate_yz < lateral_tolerance) & ( (x_now > 0) & (x_now < plane_threshold) )
         ).float()
         
         # switch to progress in x_direction
         # progress_reward = torch.where(
         #     involume > 0., 4 * torch.tanh( (x_prev - x_now) * 2.0 ), progress_reward
         # )
-
-        # if self.cfg.is_train:
-        #     cross_plane = (x_prev < 0) & (x_now > 0)
-        #     gate_passed = ((dist_to_gate_yz < 0.4) & cross_plane).float()
-        # else:
-        #     cross_plane = torch.abs(x_now) < 0.2
-        #     gate_passed = ((dist_to_gate_yz < 0.4) & cross_plane).float()
-        
         ids_gate_passed = torch.where(gate_passed)[0]
         
         # Advance waypoint for passed envs
@@ -459,7 +452,7 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
             self.env._prev_x_drone_wrt_gate[ids_gate_passed] = new_pos_gate[:, 0]
         
         # ---------------------------------------------------------
-        gate_bonus = gate_passed * torch.exp( - dist_to_gate_yz / 0.4 )
+        gate_bonus = gate_passed * torch.exp( - dist_to_gate_yz / 0.5 )
 
         # ---------------------------------------------------------
         # 4. Combine rewards
@@ -469,7 +462,7 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
             # + 2.0 * alignment_reward
             # + involume * 2.0 * yaw_reward
             # + 0.1 * velocity_reward
-            + 40.0 * gate_bonus # gate bonus
+            + 80.0 * gate_bonus # gate bonus
             + smoothness_penalty
             + ang_rate_penalty
             + (-10.0) * crashed
@@ -633,8 +626,8 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         # Handle play mode initial position
         if not self.cfg.is_train:
             # x_local and y_local are randomly sampled
-            x_local = torch.empty(1, device=self.device).uniform_(-3.0, -0.5)
-            y_local = torch.empty(1, device=self.device).uniform_(-1.0, 1.0)
+            x_local = torch.empty((n_reset, ), device=self.device).uniform_(-3.0, -0.5)
+            y_local = torch.empty((n_reset, ), device=self.device).uniform_(-1.0, 1.0)
 
             x0_wp = self.env._waypoints[self.env._initial_wp, 0]
             y0_wp = self.env._waypoints[self.env._initial_wp, 1]
@@ -651,7 +644,7 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
             # point drone towards the zeroth gate
             yaw0 = torch.atan2(y0_wp - y0, x0_wp - x0)
 
-            default_root_state = self.env._robot.data.default_root_state[0].unsqueeze(0)
+            default_root_state = self.env._robot.data.default_root_state[env_ids]
             default_root_state[:, 0] = x0
             default_root_state[:, 1] = y0
             default_root_state[:, 2] = z0
@@ -741,12 +734,10 @@ class PassGateGPT2(PassGateGPT1):
         
         P0_yaw = self.env._waypoints[gate_idx, -1]
         P1_yaw = self.env._waypoints[gate_idx_next, -1]
-        m0 = torch.stack([torch.cos(P0_yaw), torch.sin(P0_yaw), torch.zeros_like(P0_yaw)], dim=1) * 8.0
-        m1 = torch.stack([torch.cos(P1_yaw), torch.sin(P1_yaw), torch.zeros_like(P1_yaw)], dim=1) * 8.0
+        m0 = torch.stack([torch.cos(P0_yaw), torch.sin(P0_yaw), torch.zeros_like(P0_yaw)], dim=1) * (-8.0)
+        m1 = torch.stack([torch.cos(P1_yaw), torch.sin(P1_yaw), torch.zeros_like(P1_yaw)], dim=1) * (-8.0)
         
-        max_ratio = max(0, 0.85 - self.initial_noise)
-        t = (0.9 - max_ratio) * torch.rand((len(gate_idx), 1), device=P0.device) + max_ratio
-        
+        t = 0.95 * torch.rand((len(gate_idx), 1), device=P0.device)
         noise = torch.randn_like(P1) * self.initial_noise
         spawn_pts = hermite_segment(P0, P1, m0, m1, t) + noise
         
@@ -769,9 +760,10 @@ class PassGateGPT2(PassGateGPT1):
             env_ids = self.env._robot._ALL_INDICES
 
         # Logging for training mode
-        gate_passed = self._episode_sums["gate_passed"]
-        self.initial_noise = max(0.05, torch.mean(gate_passed).item() * 4)
+        self.initial_noise = 0.01
         if self.cfg.is_train and hasattr(self, '_episode_sums'):
+            gate_passed = self._episode_sums["gate_passed"]
+            self.initial_noise = min( max(0.01, torch.mean(gate_passed).item()), 0.5 )
             extras = dict()
             for key in self._episode_sums.keys():
                 episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
@@ -834,8 +826,8 @@ class PassGateGPT2(PassGateGPT1):
         # Handle play mode initial position
         if not self.cfg.is_train:
             # x_local and y_local are randomly sampled
-            x_local = torch.empty(1, device=self.device).uniform_(-3.0, -0.5)
-            y_local = torch.empty(1, device=self.device).uniform_(-1.0, 1.0)
+            x_local = torch.empty((n_reset, ), device=self.device).uniform_(-3.0, -0.5)
+            y_local = torch.empty((n_reset, ), device=self.device).uniform_(-1.0, 1.0)
 
             x0_wp = self.env._waypoints[self.env._initial_wp, 0]
             y0_wp = self.env._waypoints[self.env._initial_wp, 1]
@@ -852,7 +844,7 @@ class PassGateGPT2(PassGateGPT1):
             # point drone towards the zeroth gate
             yaw0 = torch.atan2(y0_wp - y0, x0_wp - x0)
 
-            default_root_state = self.env._robot.data.default_root_state[0].unsqueeze(0)
+            default_root_state = self.env._robot.data.default_root_state[env_ids]
             default_root_state[:, 0] = x0
             default_root_state[:, 1] = y0
             default_root_state[:, 2] = z0

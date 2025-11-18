@@ -230,7 +230,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     rewards = {}
 
     # Strategy class for custom rewards, observations, and resets
-    strategy_class: type[DefaultQuadcopterStrategy] = PassGateGPT1
+    strategy_class: type[DefaultQuadcopterStrategy] = PassGateGPT2
 
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
