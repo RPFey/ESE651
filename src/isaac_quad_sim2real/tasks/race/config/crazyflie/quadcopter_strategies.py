@@ -37,7 +37,7 @@ def catmull_rom_tangent(P0, P1, P2, P3, t):
         3*(-P0 + 3*P1 - 3*P2 + P3) * t2
     )
 
-class DefaultQuadcopterStrategy:
+class StrategyBase:
     """Default strategy implementation for quadcopter environment."""
 
     def __init__(self, env: QuadcopterEnv):
@@ -354,7 +354,7 @@ class DefaultQuadcopterStrategy:
         self.env._crashed[env_ids] = 0
         
         
-class PassGateGPT1(DefaultQuadcopterStrategy):
+class PassGateRewardStrat(StrategyBase):
     """A strategy that extends the DefaultQuadcopterStrategy with a simple modification."""
 
     def get_rewards(self) -> torch.Tensor:
@@ -418,7 +418,7 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         x_now = self.env._pose_drone_wrt_gate[:, 0]
         x_prev = self.env._prev_x_drone_wrt_gate
         
-        volume_tolerance, lateral_tolerance, x_tolerance = 0.5, 0.5, 0.2
+        volume_tolerance, lateral_tolerance, x_tolerance = 0.45, 0.45, 0.2
         plane_threshold = 0.1
         # involume = (
         #     (dist_to_gate_yz < volume_tolerance) & (x_now > 0) & (x_now < x_tolerance)
@@ -452,20 +452,20 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
             self.env._prev_x_drone_wrt_gate[ids_gate_passed] = new_pos_gate[:, 0]
         
         # ---------------------------------------------------------
-        gate_bonus = gate_passed * torch.exp( - dist_to_gate_yz / 0.5 )
+        gate_bonus = gate_passed # * torch.exp( - dist_to_gate_yz / 0.5 )
 
         # ---------------------------------------------------------
         # 4. Combine rewards
         # ---------------------------------------------------------
         reward = (
-            + 20.0 * (1 - gate_passed) * progress_reward # if drone passes gate, no more progress reward until next gate
+            + 2.0 * (1 - gate_passed) * progress_reward # if drone passes gate, no more progress reward until next gate
             # + 2.0 * alignment_reward
             # + involume * 2.0 * yaw_reward
             # + 0.1 * velocity_reward
-            + 80.0 * gate_bonus # gate bonus
+            + 50.0 * gate_bonus # gate bonus
             + smoothness_penalty
             + ang_rate_penalty
-            + (-10.0) * crashed
+            + (-20.0) * crashed
         )
 
         if self.cfg.is_train:
@@ -684,7 +684,14 @@ class PassGateGPT1(DefaultQuadcopterStrategy):
         self.env._prev_x_drone_wrt_gate = self.env._pose_drone_wrt_gate[:, 0].clone()
         self.env._crashed[env_ids] = 0
         
-class PassGateGPT2(PassGateGPT1):
+class DefaultQuadcopterStrategy(PassGateRewardStrat):
+    def __init__(self, env):
+        super().__init__(env)
+        self.initial_noise = 0.1
+        
+        self.stats_buffer = env.num_envs
+        self.gate_passed_buffer = torch.zeros((self.stats_buffer, ), device=self.device)
+        self.noise_reset_env = 0
     
     def Catmull_Rom_spline(self, gate_idx):
         num_gates = self.env._waypoints.shape[0]
@@ -738,7 +745,8 @@ class PassGateGPT2(PassGateGPT1):
         m1 = torch.stack([torch.cos(P1_yaw), torch.sin(P1_yaw), torch.zeros_like(P1_yaw)], dim=1) * (-8.0)
         
         t = 0.95 * torch.rand((len(gate_idx), 1), device=P0.device)
-        noise = torch.randn_like(P1) * self.initial_noise
+        # noise = torch.randn_like(P1) * self.initial_noise
+        noise = torch.empty_like(P1).uniform_(-1 * self.initial_noise, self.initial_noise)
         spawn_pts = hermite_segment(P0, P1, m0, m1, t) + noise
         
         # point drone towards the zeroth gate
@@ -753,6 +761,76 @@ class PassGateGPT2(PassGateGPT1):
         )
         
         return spawn_pts, quat
+    
+    def gate_initialize(self, gate_idx):
+        """ Initialize behind the gate """
+        # x_local and y_local are randomly sampled
+        n_reset = len(gate_idx)
+        next_gate_idx = (gate_idx + 1) % self.env._waypoints.shape[0]
+        gate_x = self.env._waypoints[next_gate_idx][:, 0]
+        gate_y = self.env._waypoints[next_gate_idx][:, 1]
+        gate_z = self.env._waypoints[next_gate_idx][:, 2]
+        gate_yaw = self.env._waypoints[next_gate_idx][:, -1]
+        
+        # 3) local-frame spawn offsets
+        # BEFORE gate: x_local ∈ [-3, -1]
+        # AFTER gate:  x_local ∈ [ 1,  3]
+        x_local = torch.empty((n_reset, ), device=self.device).uniform_(-3.0, -0.5)
+        y_local = torch.empty((n_reset, ), device=self.device).uniform_(-1.0, 1.0)
+        z_local = (torch.rand(n_reset, device=self.device) - 0.5) * 0.2           # ±0.1 m
+
+        # 4) rotate from gate frame → world frame
+        cos_t = torch.cos(gate_yaw)
+        sin_t = torch.sin(gate_yaw)
+        x_rot = cos_t * x_local - sin_t * y_local
+        y_rot = sin_t * x_local + cos_t * y_local
+
+        spawn_x = gate_x - x_rot
+        spawn_y = gate_y - y_rot
+        spawn_z = gate_z + z_local
+        spawn_pts = torch.stack([spawn_x, spawn_y, spawn_z], dim=1)
+
+        # point drone towards the zeroth gate
+        target_gate = next_gate_idx
+        tx = self.env._waypoints[target_gate][:, 0]
+        ty = self.env._waypoints[target_gate][:, 1]
+        initial_yaw = torch.atan2(ty - spawn_y, tx - spawn_x)
+        quat = quat_from_euler_xyz(
+            torch.zeros(1, device=self.device),
+            torch.zeros(1, device=self.device),
+            initial_yaw + torch.empty(1, device=self.device).uniform_(-0.15, 0.15)
+        )        
+        return spawn_pts, quat
+    
+    def eval_gate_initialize(self, gate_idx):
+        """ Initialize behind the gate """
+        # x_local and y_local are randomly sampled
+        n_reset = len(gate_idx)
+        x_local = torch.empty((n_reset, ), device=self.device).uniform_(-3.0, -0.5)
+        y_local = torch.empty((n_reset, ), device=self.device).uniform_(-1.0, 1.0)
+
+        x0_wp = self.env._waypoints[self.env._initial_wp, 0]
+        y0_wp = self.env._waypoints[self.env._initial_wp, 1]
+        theta = self.env._waypoints[self.env._initial_wp, -1]
+
+        # rotate local pos to global frame
+        cos_theta, sin_theta = torch.cos(theta), torch.sin(theta)
+        x_rot = cos_theta * x_local - sin_theta * y_local
+        y_rot = sin_theta * x_local + cos_theta * y_local
+        x0 = x0_wp - x_rot
+        y0 = y0_wp - y_rot
+        z0 = 0.05 * torch.ones_like(x0)
+
+        # point drone towards the zeroth gate
+        yaw0 = torch.atan2(y0_wp - y0, x0_wp - x0)
+        spawn_pts = torch.stack([x0, y0, z0], dim=1)
+
+        quat = quat_from_euler_xyz(
+            torch.zeros(1, device=self.device),
+            torch.zeros(1, device=self.device),
+            yaw0
+        )
+        return spawn_pts, quat
         
     def reset_idx(self, env_ids):
         """Reset specific environments to initial states."""
@@ -760,10 +838,25 @@ class PassGateGPT2(PassGateGPT1):
             env_ids = self.env._robot._ALL_INDICES
 
         # Logging for training mode
-        self.initial_noise = 0.01
         if self.cfg.is_train and hasattr(self, '_episode_sums'):
-            gate_passed = self._episode_sums["gate_passed"]
-            self.initial_noise = min( max(0.01, torch.mean(gate_passed).item()), 0.5 )
+            
+            gate_passed_stats = self._episode_sums["gate_passed"][env_ids] / self.env.max_episode_length_s
+            # change device
+            if self.gate_passed_buffer.device != gate_passed_stats.device:
+                self.gate_passed_buffer = self.gate_passed_buffer.to(gate_passed_stats.device)
+            self.gate_passed_buffer = torch.cat([self.gate_passed_buffer, gate_passed_stats])
+            if len(self.gate_passed_buffer) > self.stats_buffer:
+                self.gate_passed_buffer = self.gate_passed_buffer[-self.stats_buffer:]
+            smoothed_mean_gate_passed = self.gate_passed_buffer.mean().item()
+            
+            self.noise_reset_env = min(len(env_ids) + self.noise_reset_env,  2 * self.env.num_envs)
+            if smoothed_mean_gate_passed > 0.4 and self.noise_reset_env > self.env.num_envs and self.initial_noise < 5.5:
+                self.initial_noise *= 1.5
+                self.noise_reset_env = 0
+            elif smoothed_mean_gate_passed < 0.2 and self.noise_reset_env > self.env.num_envs and self.initial_noise > 0.1:
+                self.initial_noise *= 0.75
+                self.noise_reset_env = 0
+                
             extras = dict()
             for key in self._episode_sums.keys():
                 episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
@@ -774,6 +867,8 @@ class PassGateGPT2(PassGateGPT1):
             extras = dict()
             extras["Episode_Termination/died"] = torch.count_nonzero(self.env.reset_terminated[env_ids]).item()
             extras["Episode_Termination/time_out"] = torch.count_nonzero(self.env.reset_time_outs[env_ids]).item()
+            extras["Episode_Termination/added_noise"] = self.initial_noise
+            extras["Episode_Termination/smooth_gate_passed"] = smoothed_mean_gate_passed
             self.env.extras["log"].update(extras)
 
         # Call robot reset first
@@ -816,8 +911,19 @@ class PassGateGPT2(PassGateGPT1):
         # This example code initializes the drone 2m behind the first gate. You should delete it or heavily
         # modify it once you begin the racing task.
         num_gates = self.env._waypoints.shape[0]
+        # start_gate_idx = (self.env._initial_wp - 1) * torch.ones((n_reset,), device=self.device).int()  # always start from gate 0
+        # spawn_pts_sg1, quat_sg1 = self.eval_gate_initialize(start_gate_idx)
         gate_idx = torch.randint(0, num_gates, (n_reset,), device=self.device) # .item()
-        spawn_pts, quat = self.Hermit_spline(gate_idx)
+        spawn_pts_sg1, quat_sg1 = self.gate_initialize(gate_idx)
+        spawn_pts_sg2, quat_sg2 = self.Hermit_spline(gate_idx)
+         
+        # mix two as 0.2 - 0.8
+        mix_ratio = 0.2
+        sg1_mask = (torch.rand(n_reset, device=self.device) < mix_ratio).float()
+        spawn_pts = sg1_mask.view(-1, 1) * spawn_pts_sg1 + (1 - sg1_mask.view(-1, 1)) * spawn_pts_sg2
+        quat = sg1_mask.view(-1, 1) * quat_sg1 + (1 - sg1_mask.view(-1, 1)) * quat_sg2
+        # curr_gate_idx = torch.where(sg1_mask > 0.5, start_gate_idx, gate_idx)
+        
         target_gate = ((gate_idx + 1) % num_gates).int()
         default_root_state[:, :3] = spawn_pts
         default_root_state[:, 3:7] = quat
@@ -883,5 +989,37 @@ class PassGateGPT2(PassGateGPT1):
 
         self.env._prev_x_drone_wrt_gate = self.env._pose_drone_wrt_gate[:, 0].clone()
         self.env._crashed[env_ids] = 0
+        
+        # Setup gains
+        if self.cfg.is_train and hasattr(self, '_episode_sums'):
+            smooth_gate_passed = self.gate_passed_buffer.mean().item()
+            random_strength = max( min( (smooth_gate_passed - 0.2) / 0.1, 1), 1e-3)  # scale from 0.0 to 1.0
+            
+            extras = dict()
+            extras["Episode_Termination/random_strength"] = random_strength
+            self.env.extras["log"].update(extras)
+            
+            self.env._thrust_to_weight[env_ids] = self.env._twr_value * (
+                torch.empty(len(env_ids), device=self.device).uniform_(1.0-0.05*random_strength, 1.0+0.05*random_strength))
+            self.env._K_aero[env_ids, :2] = self.env._k_aero_xy_value * (
+                2**torch.empty((len(env_ids), 1), device=self.device).uniform_(-1.0*random_strength, 1.0*random_strength).expand(len(env_ids), 2)
+                )
+            self.env._K_aero[env_ids, 2] = self.env._k_aero_z_value * (
+                2**torch.empty(len(env_ids), device=self.device).uniform_(-1.0*random_strength, 1.0*random_strength))
+
+            self.env._kp_omega[env_ids, :2] = self.env._kp_omega_rp_value * (
+                torch.empty((len(env_ids), 1), device=self.device).uniform_(1.0-0.15*random_strength, 1.0+0.15*random_strength).expand(len(env_ids), 2) )
+            self.env._ki_omega[env_ids, :2] = self.env._ki_omega_rp_value * (
+                torch.empty((len(env_ids), 1), device=self.device).uniform_(1.0-0.15*random_strength, 1.0+0.15*random_strength).expand(len(env_ids), 2) )
+            self.env._kd_omega[env_ids, :2] = self.env._kd_omega_rp_value * (
+                torch.empty((len(env_ids), 1), device=self.device).uniform_(1.0-0.3*random_strength, 1.0+0.3*random_strength).expand(len(env_ids), 2) )
+
+            self.env._kp_omega[env_ids, 2] = self.env._kp_omega_y_value * (
+                torch.empty(len(env_ids), device=self.device).uniform_(1.0-0.15*random_strength, 1.0+0.15*random_strength) )
+            self.env._ki_omega[env_ids, 2] = self.env._ki_omega_y_value * (
+                torch.empty(len(env_ids), device=self.device).uniform_(1.0-0.15*random_strength, 1.0+0.15*random_strength) )
+            self.env._kd_omega[env_ids, 2] = self.env._kd_omega_y_value * (
+                torch.empty(len(env_ids), device=self.device).uniform_(1.0-0.3*random_strength, 1.0+0.3*random_strength) )
+
     
     
