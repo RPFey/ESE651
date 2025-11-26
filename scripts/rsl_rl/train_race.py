@@ -110,13 +110,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     progress_goal_reward_scale = 50.0
     gate_passed_reward_scale = 100.0
     crash_reward = -1.0
-    death_cost = -100.0
+    death_cost = -240.0
 
     rewards = {
         'progress_goal_reward_scale': progress_goal_reward_scale,
         "gate_passed_reward_scale": gate_passed_reward_scale,
         'crash_reward_scale': crash_reward,
         'death_cost': death_cost,
+        "traverse_time_reward_scale": 1.0,
     }
     # TODO ----- END -----
 
@@ -166,7 +167,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
 
     # close the simulator
     env.close()

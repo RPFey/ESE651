@@ -231,7 +231,7 @@ class OnPolicyRunner:
             self.current_learning_iteration = it
 
             # Logging info and save checkpoint
-            if self.log_dir is not None:
+            if self.log_dir is not None and len(rewbuffer) > 0:
                 # Log information
                 self.log(locals())
                 # Save model

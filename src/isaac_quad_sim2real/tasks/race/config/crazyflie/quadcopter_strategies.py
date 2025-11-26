@@ -81,6 +81,8 @@ class StrategyBase:
 
         # Thrust to weight ratio
         self.env._thrust_to_weight[:] = self.env._twr_value
+        
+        self.last_gate_passed_length = torch.zeros(self.num_envs, device=self.device)
 
     def get_rewards(self) -> torch.Tensor:
         """get_rewards() is called per timestep. This is where you define your reward structure and compute them
@@ -168,15 +170,18 @@ class StrategyBase:
             self.env._robot.data.root_quat_w,
             next_gate_pos_w
         )
+        
+        # elapsed time in the episode
+        last_pass_time = (self.env.episode_length_buf * self.env.physics_dt).view(-1, 1) - \
+            self.last_gate_passed_length.unsqueeze(1)
 
         # Previous actions
         # prev_actions = self.env._previous_actions  # Shape: (num_envs, 4)
 
         # Number of gates passed
-        # gates_passed = self.env._n_gates_passed.unsqueeze(1).float()
+        gates_passed = self.env._n_gates_passed.unsqueeze(1).float()
 
         # TODO ----- END -----
-
         obs = torch.cat(
             # TODO ----- START ----- List your observation tensors here to be concatenated together
             [
@@ -188,6 +193,8 @@ class StrategyBase:
                 current_gate_yaw,
                 next_gate_pos_b,
                 next_gate_yaw,
+                last_pass_time,
+                gates_passed
             ],
             # TODO ----- END -----
             dim=-1,
@@ -350,8 +357,8 @@ class StrategyBase:
         )
 
         self.env._prev_x_drone_wrt_gate = torch.ones(self.num_envs, device=self.device)
-
         self.env._crashed[env_ids] = 0
+        self.last_gate_passed_length[env_ids] = self.env.episode_length_buf[env_ids] * self.env.physics_dt
         
         
 class PassGateRewardStrat(StrategyBase):
@@ -369,38 +376,6 @@ class PassGateRewardStrat(StrategyBase):
         dist_prev = self.env._last_distance_to_goal                  # (N,)
         progress_delta = dist_prev - dist_now
         progress_reward = torch.tanh(progress_delta * 2.0) # / 2.0
-
-        # (B) Gate position alignment (drone in gate frame)
-        pos_gate_frame = self.env._pose_drone_wrt_gate
-        lateral_error = torch.linalg.norm(pos_gate_frame[:, :2], dim=1)
-        alignment_reward = torch.exp(-3.0 * lateral_error)
-        
-        # (C) Yaw alignment
-        drone_quat = self.env._robot.data.root_quat_w
-        drone_yaw = euler_xyz_from_quat(drone_quat)[2]
-
-        gate_quat = self.env._waypoints_quat[self.env._idx_wp, :]
-        gate_yaw = euler_xyz_from_quat(gate_quat)[2]
-        yaw_error = torch.abs(wrap_to_pi(gate_yaw - drone_yaw))
-        yaw_reward = torch.exp(-1.5 * torch.abs(yaw_error))
-
-        # (D) Velocity alignment (reward forward body velocity)
-        vel_body = self.env._robot.data.root_com_lin_vel_b
-        forward_vel = vel_body[:, 0]
-        velocity_reward = torch.tanh(forward_vel / 1.0).clamp(min=0.0)
-        
-        # ---------------------------------------------------------
-        # 2. Penalties
-        # ---------------------------------------------------------
-        # Action smoothness penalty
-        actions = self.env._actions
-        prev_actions = self.env._previous_actions
-        action_change = torch.linalg.norm(actions - prev_actions, dim=1)
-        smoothness_penalty = -0.05 * action_change
-
-        # Angular rate penalty
-        ang_vel = self.env._robot.data.root_ang_vel_b
-        ang_rate_penalty = -0.02 * torch.linalg.norm(ang_vel, dim=1)
 
         # Crash penalty (from contact forces)
         contact_forces = self.env._contact_sensor.data.net_forces_w
@@ -425,14 +400,22 @@ class PassGateRewardStrat(StrategyBase):
         # ).float()
         # plane_cross = ( (x_prev > plane_threshold) & (x_now < plane_threshold) ) | (x_prev < -plane_threshold) & (x_now > -plane_threshold)
         gate_passed = (
-            (dist_to_gate_yz < lateral_tolerance) & ( (x_now > 0) & (x_now < plane_threshold) )
-        ).float()
+            (torch.abs(self.env._pose_drone_wrt_gate[:, 1]) < 0.5) & 
+            (torch.abs(self.env._pose_drone_wrt_gate[:, 2]) < 0.5) & 
+            ( (x_now * x_prev) <= 0 ) ).float()
         
-        # switch to progress in x_direction
-        # progress_reward = torch.where(
-        #     involume > 0., 4 * torch.tanh( (x_prev - x_now) * 2.0 ), progress_reward
-        # )
+        # update gate passed
+        self.env._n_gates_passed += gate_passed.int()
         ids_gate_passed = torch.where(gate_passed)[0]
+        
+        # Compute reward bonus for passing gate quickly
+        gate_time_elapse = (self.env.episode_length_buf * self.env.physics_dt) - \
+                                    self.last_gate_passed_length
+        gate_bonus = gate_passed * ( torch.exp(- gate_time_elapse) + 1.0)
+        
+        if not torch.all(self.env.episode_length_buf * self.env.physics_dt >= self.last_gate_passed_length):
+            breakpoint()
+            pass
         
         # Advance waypoint for passed envs
         if len(ids_gate_passed) > 0:
@@ -450,21 +433,19 @@ class PassGateRewardStrat(StrategyBase):
                 self.env._robot.data.root_link_state_w[ids_gate_passed, :3]
             )       
             self.env._prev_x_drone_wrt_gate[ids_gate_passed] = new_pos_gate[:, 0]
-        
-        # ---------------------------------------------------------
-        gate_bonus = gate_passed # * torch.exp( - dist_to_gate_yz / 0.5 )
+            self.last_gate_passed_length[ids_gate_passed] = self.env.episode_length_buf[ids_gate_passed] * self.env.physics_dt
 
         # ---------------------------------------------------------
         # 4. Combine rewards
         # ---------------------------------------------------------
         reward = (
-            + 2.0 * (1 - gate_passed) * progress_reward # if drone passes gate, no more progress reward until next gate
+            # + 2.0 * (1 - gate_passed) * progress_reward # if drone passes gate, no more progress reward until next gate
             # + 2.0 * alignment_reward
             # + involume * 2.0 * yaw_reward
-            # + 0.1 * velocity_reward
-            + 50.0 * gate_bonus # gate bonus
-            + smoothness_penalty
-            + ang_rate_penalty
+            # + 0.5 * velocity_reward
+            + 250.0 * gate_bonus # gate bonus
+            # + smoothness_penalty
+            # + ang_rate_penalty
             + (-20.0) * crashed
         )
 
@@ -493,7 +474,8 @@ class PassGateRewardStrat(StrategyBase):
             rewards = {
                 "progress_goal": progress_reward, 
                 "gate_passed": gate_passed,
-                "crash": crashed
+                "crash": crashed, 
+                "traverse_time": gate_passed * gate_time_elapse
             }
             for key, value in rewards.items():
                 self._episode_sums[key] += value
@@ -512,9 +494,14 @@ class PassGateRewardStrat(StrategyBase):
         if self.cfg.is_train and hasattr(self, '_episode_sums'):
             extras = dict()
             for key in self._episode_sums.keys():
-                episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-                extras["Episode_Reward/" + key] = episodic_sum_avg / self.env.max_episode_length_s
+                if key in ["traverse_time"]:
+                    gate_traverse_avg = torch.mean(self._episode_sums["traverse_time"][env_ids] / torch.max(1, self.env._n_gates_passed[env_ids]) )
+                    extras["Episode_Reward/" + key] = gate_traverse_avg.item()
+                else:
+                    episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+                    extras["Episode_Reward/" + key] = episodic_sum_avg / self.env.max_episode_length_s
                 self._episode_sums[key][env_ids] = 0.0
+            
             self.env.extras["log"] = dict()
             self.env.extras["log"].update(extras)
             extras = dict()
@@ -538,7 +525,7 @@ class PassGateRewardStrat(StrategyBase):
             self.env._models_paths_initialized = True
 
         n_reset = len(env_ids)
-        if n_reset == self.num_envs and self.num_envs > 1:
+        if n_reset == self.num_envs and self.num_envs > 1 and self.cfg.is_train:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf,
                                                              high=int(self.env.max_episode_length))
 
@@ -683,6 +670,7 @@ class PassGateRewardStrat(StrategyBase):
 
         self.env._prev_x_drone_wrt_gate = self.env._pose_drone_wrt_gate[:, 0].clone()
         self.env._crashed[env_ids] = 0
+        self.last_gate_passed_length[env_ids] = self.env.episode_length_buf[env_ids] * self.env.physics_dt
         
 class DefaultQuadcopterStrategy(PassGateRewardStrat):
     def __init__(self, env):
@@ -850,7 +838,7 @@ class DefaultQuadcopterStrategy(PassGateRewardStrat):
             smoothed_mean_gate_passed = self.gate_passed_buffer.mean().item()
             
             self.noise_reset_env = min(len(env_ids) + self.noise_reset_env,  2 * self.env.num_envs)
-            if smoothed_mean_gate_passed > 0.4 and self.noise_reset_env > self.env.num_envs and self.initial_noise < 5.5:
+            if smoothed_mean_gate_passed > 0.4 and self.noise_reset_env > self.env.num_envs and self.initial_noise < 1.0:
                 self.initial_noise *= 1.5
                 self.noise_reset_env = 0
             elif smoothed_mean_gate_passed < 0.2 and self.noise_reset_env > self.env.num_envs and self.initial_noise > 0.1:
@@ -887,9 +875,10 @@ class DefaultQuadcopterStrategy(PassGateRewardStrat):
             self.env._models_paths_initialized = True
 
         n_reset = len(env_ids)
-        if n_reset == self.num_envs and self.num_envs > 1:
-            self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf,
-                                                             high=int(self.env.max_episode_length))
+        self.env.episode_length_buf[env_ids] = 0
+        # if n_reset == self.num_envs and self.num_envs > 1 and self.cfg.is_train:
+        #     self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf,
+        #                                                      high=int(self.env.max_episode_length))
 
         # Reset action buffers
         self.env._actions[env_ids] = 0.0
@@ -917,8 +906,8 @@ class DefaultQuadcopterStrategy(PassGateRewardStrat):
         spawn_pts_sg1, quat_sg1 = self.gate_initialize(gate_idx)
         spawn_pts_sg2, quat_sg2 = self.Hermit_spline(gate_idx)
          
-        # mix two as 0.2 - 0.8
-        mix_ratio = 0.2
+        # mix two as 0.4 - 0.6
+        mix_ratio = 0.5
         sg1_mask = (torch.rand(n_reset, device=self.device) < mix_ratio).float()
         spawn_pts = sg1_mask.view(-1, 1) * spawn_pts_sg1 + (1 - sg1_mask.view(-1, 1)) * spawn_pts_sg2
         quat = sg1_mask.view(-1, 1) * quat_sg1 + (1 - sg1_mask.view(-1, 1)) * quat_sg2
@@ -989,6 +978,7 @@ class DefaultQuadcopterStrategy(PassGateRewardStrat):
 
         self.env._prev_x_drone_wrt_gate = self.env._pose_drone_wrt_gate[:, 0].clone()
         self.env._crashed[env_ids] = 0
+        self.last_gate_passed_length[env_ids] = self.env.episode_length_buf[env_ids] * self.env.physics_dt
         
         # Setup gains
         if self.cfg.is_train and hasattr(self, '_episode_sums'):
