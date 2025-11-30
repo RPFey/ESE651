@@ -25,9 +25,27 @@ python  scripts/rsl_rl/train_race.py \
     --task Isaac-Quadcopter-Race-v0 \
     --num_envs 2048 \
     --experiment_name gptv1 \
-    --max_iterations 1000 \
+    --max_iterations 2000 \
     --headless \
     --logger wandb
+
+python  scripts/rsl_rl/train_race.py \
+    --task Isaac-Quadcopter-Race-v0 \
+    --num_envs 16 \
+    --experiment_name gptv1 \
+    --max_iterations 2000 \
+    --logger wandb
+
+python  scripts/rsl_rl/train_race.py \
+    hydra.searchpath="[file://home/kostas-lab/Documents/ESE651/ESE651/src/third_parties/rsl_rl_local/config]" \
+    --task Isaac-Quadcopter-Race-v0 \
+    --config-name dummy_config.yaml \
+    --num_envs 8192 \
+    --experiment_name gptv1 \
+    --max_iterations 20000 \
+    --headless \
+    --logger wandb
+
 ```
 
 ## Evaluation
@@ -47,11 +65,11 @@ python scripts/rsl_rl/play_race.py \
 python scripts/rsl_rl/play_race.py \
     --task Isaac-Quadcopter-Race-v0 \
     --num_envs 1 \
-    --load_run 2025-11-15_20-50-23 \
+    --load_run 2025-11-17_23-23-43 \
     --checkpoint best_model.pt \
     --headless \
     --video \
-    --video_length 800
+    --video_length 1200
 ```
 
 **Note:** Neither command will work until PPO is implemented as per the next section.

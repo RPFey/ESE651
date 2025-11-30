@@ -83,6 +83,11 @@ def main():
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
     log_dir = os.path.dirname(resume_path)
+    
+    agent_cfg.policy.class_name = "ActorCriticRecurrent"
+    agent_cfg.policy.rnn_type = 'lstm'
+    agent_cfg.policy.rnn_hidden_size = 512
+    agent_cfg.policy.rnn_num_layers = 1
 
     if args_cli.follow_robot == -1:
         env_cfg.viewer.resolution = (1920, 1080)

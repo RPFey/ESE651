@@ -89,6 +89,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+    
+    agent_cfg.policy.class_name = "ActorCriticRecurrent"
+    agent_cfg.policy.rnn_type = 'lstm'
+    agent_cfg.policy.rnn_hidden_size = 512
+    agent_cfg.policy.rnn_num_layers = 1
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
